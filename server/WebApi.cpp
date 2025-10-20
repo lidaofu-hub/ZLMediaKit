@@ -391,6 +391,7 @@ Value makeMediaSourceJson(MediaSource &media){
     item["schema"] = media.getSchema();
     dumpMediaTuple(media.getMediaTuple(), item);
     item["createStamp"] = (Json::UInt64) media.getCreateStamp();
+    item["currentStamp"] = (Json::UInt64) media.getTimeStamp(TrackInvalid);
     item["aliveSecond"] = (Json::UInt64) media.getAliveSecond();
     item["bytesSpeed"] = (Json::UInt64) media.getBytesSpeed();
     item["totalBytes"] = (Json::UInt64) media.getTotalBytes();
@@ -908,12 +909,24 @@ void installWebApi() {
     // Test url1 (get streams with virtual host "__defaultVost__") http://127.0.0.1/index/api/getMediaList?vhost=__defaultVost__
     // 测试url2(获取rtsp类型的流) http://127.0.0.1/index/api/getMediaList?schema=rtsp  [AUTO-TRANSLATED:21c2c15d]
     // Test url2 (get rtsp type streams) http://127.0.0.1/index/api/getMediaList?schema=rtsp
-    api_regist("/index/api/getMediaList",[](API_ARGS_MAP){
+    api_regist("/index/api/getMediaList",[](API_ARGS_MAP_ASYNC){
         CHECK_SECRET();
         // 获取所有MediaSource列表  [AUTO-TRANSLATED:7bf16dc2]
         // Get all MediaSource lists
+        bool first = true;
+        std::shared_ptr<Json::Value> done(new Json::Value(val), [invoker, headerOut](Json::Value *val) {
+            invoker(200, headerOut, val->toStyledString());
+            delete val;
+        });
         MediaSource::for_each_media([&](const MediaSource::Ptr &media) {
-            val["data"].append(makeMediaSourceJson(*media));
+            if (first) {
+                first = false;
+                media->getOwnerPoller()->async([media, done]() mutable {
+                    (*done)["data"].append(makeMediaSourceJson(*media));
+                });
+            } else {
+                (*done)["data"].append(makeMediaSourceJson(*media));
+            }
         }, allArgs["schema"], allArgs["vhost"], allArgs["app"], allArgs["stream"]);
     });
 
@@ -2251,6 +2264,19 @@ void installWebApi() {
         // sample_ms设置为0，从配置文件加载；file_repeat可以指定，如果配置文件也指定循环解复用，那么强制开启  [AUTO-TRANSLATED:23e826b4]
         // sample_ms is set to 0, loaded from the configuration file; file_repeat can be specified, if the configuration file also specifies loop demultiplexing, then force it to be enabled
         reader->startReadMP4(0, true, allArgs["file_repeat"]);
+        auto seek_ms = allArgs["seek_ms"].as<uint32_t>();
+        auto speed = allArgs["speed"].as<float>();
+        if (seek_ms || speed) {
+            auto p = static_pointer_cast<MediaSourceEvent>(reader);
+            p->getOwnerPoller(MediaSource::NullMediaSource())->async([seek_ms, speed, p]() {
+                if (seek_ms) {
+                    p->seekTo(MediaSource::NullMediaSource(), seek_ms);
+                }
+                if (speed && speed != 1.0) {
+                    p->speed(MediaSource::NullMediaSource(), speed);
+                }
+            });
+        }
         val["data"]["duration_ms"] = (Json::UInt64)reader->getDemuxer()->getDurationMS();
     });
 #endif
