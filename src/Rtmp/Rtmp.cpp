@@ -56,30 +56,33 @@ AudioMeta::AudioMeta(const AudioTrack::Ptr &audio) {
 }
 
 uint8_t getCodecFlags(CodecId cid) {
-    switch(cid) {
-#define XX(a, b, c) case a: return static_cast<uint8_t>(b);
-    RTMP_CODEC_MAP(XX)
+    switch (cid) {
+#define XX(a, b, c)                                                                                                                                            \
+    case a: return static_cast<uint8_t>(b);
+        RTMP_CODEC_MAP(XX)
 #undef XX
+        default: return 0;
     }
-    return 0;
 }
 
 uint32_t getCodecFourCC(CodecId cid) {
-    switch(cid) {
-#define XX(a, b, c) case a: return static_cast<uint32_t>(c);
-    RTMP_CODEC_MAP(XX)
+    switch (cid) {
+#define XX(a, b, c)                                                                                                                                            \
+    case a: return static_cast<uint32_t>(c);
+        RTMP_CODEC_MAP(XX)
 #undef XX
+        default: return 0;
     }
-    return 0;
 }
 
 CodecId getFourccCodec(uint32_t id) {
-    switch(id) {
-#define XX(a, b, c) case (uint32_t)c: return a;
-    RTMP_CODEC_MAP(XX)
+    switch (id) {
+#define XX(a, b, c)                                                                                                                                            \
+    case (uint32_t)c: return a;
+        RTMP_CODEC_MAP(XX)
 #undef XX
+        default: return CodecInvalid;
     }
-    return CodecInvalid;
 }
 
 uint8_t getAudioRtmpFlags(const Track::Ptr &track) {
@@ -195,12 +198,10 @@ bool RtmpPacket::isConfigFrame() const {
     switch (type_id) {
         case MSG_AUDIO: {
             switch ((RtmpAudioCodec)getRtmpCodecId()) {
-            case RtmpAudioCodec::aac:
-                return (RtmpAACPacketType)buffer[1] == RtmpAACPacketType::aac_config_header;
-            case RtmpAudioCodec::ex_header:
-                return (RtmpPacketType)(buffer[0] & 0x0f) == RtmpPacketType::PacketTypeSequenceStart;
+                case RtmpAudioCodec::aac: return (RtmpAACPacketType)buffer[1] == RtmpAACPacketType::aac_config_header;
+                case RtmpAudioCodec::ex_header: return (RtmpPacketType)(buffer[0] & 0x0f) == RtmpPacketType::PacketTypeSequenceStart;
+                default: return false;
             }
-            return false;
         }
         case MSG_VIDEO: {
             if (!isVideoKeyFrame()) {

@@ -446,7 +446,11 @@ void RtspPlayer::sendOptions() {
 }
 
 void RtspPlayer::sendKeepAlive() {
-    _on_response = [](const Parser &parser) {};
+    if (_play_check_timer)
+    {
+        WarnL << "receive RTP packet before handleResPAUSE";
+    }
+    _on_keepalive_reponse = [](const Parser &parser) {};
     if (_supported_cmd.find("GET_PARAMETER") != _supported_cmd.end()) {
         // 支持GET_PARAMETER，用此命令保活  [AUTO-TRANSLATED:b45cd737]
         // Support GET_PARAMETER, use this command to keep alive
@@ -464,7 +468,7 @@ void RtspPlayer::sendPause(int type, uint32_t seekMS) {
     // Start or pause RTSP
     switch (type) {
         case type_pause: sendRtspRequest("PAUSE", _control_url, {}); break;
-        case type_play: sendRtspRequest("PLAY", _content_base); break;
+        case type_play:
         case type_seek:
             sendRtspRequest("PLAY", _control_url, { "Range", StrPrinter << "npt=" << setiosflags(ios::fixed) << setprecision(2) << seekMS / 1000.0 << "-" });
             break;
@@ -532,6 +536,10 @@ void RtspPlayer::onWholeRtspPacket(Parser &parser) {
     try {
         decltype(_on_response) func;
         _on_response.swap(func);
+        if (!func)
+        {
+            _on_keepalive_reponse.swap(func);
+        }
         if (func) {
             func(parser);
         }
@@ -582,6 +590,9 @@ void RtspPlayer::onRtcpPacket(int track_idx, SdpTrack::Ptr &track, uint8_t *data
 
 void RtspPlayer::onRtpSorted(RtpPacket::Ptr rtppt, int trackidx) {
     _stamp[trackidx] = rtppt->getStampMS();
+    if (!_first_stamp[trackidx]) {
+        _first_stamp[trackidx] = _stamp[trackidx];
+    }
     _rtp_recv_ticker.resetTime();
     onRecvRTP(std::move(rtppt), _sdp_track[trackidx]);
 }
@@ -609,7 +620,7 @@ float RtspPlayer::getPacketLossRate(TrackType type) const {
 }
 
 uint32_t RtspPlayer::getProgressMilliSecond() const {
-    return MAX(_stamp[0], _stamp[1]);
+    return MAX(_stamp[0] - _first_stamp[0], _stamp[1] - _first_stamp[1]);
 }
 
 void RtspPlayer::seekToMilliSecond(uint32_t ms) {
@@ -685,14 +696,18 @@ void RtspPlayer::sendRtspRequest(const string &cmd, const string &url, const Str
     printer << cmd << " " << url << " RTSP/1.0\r\n";
 
     TraceL << cmd << " "<< url;
+
+    if (cmd == "PLAY") {
+        // play命令时支持覆盖更新rtsp头，用于onvif点播等场景
+        for (auto &pr : _custom_header) {
+            header[pr.first] = pr.second;
+        }
+    }
+
     for (auto &pr : header) {
         printer << pr.first << ": " << pr.second << "\r\n";
     }
-    if (cmd == "PLAY") {
-        for (auto &pr : _custom_header) {
-            printer << pr.first << ": " << pr.second << "\r\n";
-        }
-    }
+
     printer << "\r\n";
     SockSender::send(std::move(printer));
 }
