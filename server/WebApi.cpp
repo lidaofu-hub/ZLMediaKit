@@ -225,16 +225,18 @@ ApiArgsType getAllArgs(const Parser &parser) {
             allArgs[pr.first] = strCoding::UrlDecodeComponent(pr.second);
         }
     } else if (parser["Content-Type"].find("application/json") == 0) {
-        try {
-            stringstream ss(parser.content());
-            Value jsonArgs;
-            ss >> jsonArgs;
-            auto keys = jsonArgs.getMemberNames();
-            for (auto key = keys.begin(); key != keys.end(); ++key) {
-                allArgs[*key] = jsonArgs[*key].asString();
+        if (!parser.content().empty()) {
+            try {
+                stringstream ss(parser.content());
+                Value jsonArgs;
+                ss >> jsonArgs;
+                auto keys = jsonArgs.getMemberNames();
+                for (auto key = keys.begin(); key != keys.end(); ++key) {
+                    allArgs[*key] = jsonArgs[*key].asString();
+                }
+            } catch (std::exception &ex) {
+                WarnL << ex.what();
             }
-        } catch (std::exception &ex) {
-            WarnL << ex.what();
         }
     } else if (!parser["Content-Type"].empty()) {
         WarnL << "invalid Content-Type:" << parser["Content-Type"];
@@ -2372,14 +2374,19 @@ void installWebApi() {
             }
         };
 
-        bool flag = NOTICE_EMIT(BroadcastHttpAccessArgs, Broadcast::kBroadcastHttpAccess, allArgs.parser, file_path, false, file_invoker, sender);
-        if (!flag) {
-            // 文件下载鉴权事件无人监听，不允许下载  [AUTO-TRANSLATED:5e02f0ce]
-            // No one is listening to the file download authentication event, download is not allowed
-            invoker(401, StrCaseMap {}, "None http access event listener");
+        try {
+            CHECK_SECRET();
+            // 校验secret成功，文件下载鉴权成功
+            file_invoker("", "", 0);
+        } catch (...) {
+            bool flag = NOTICE_EMIT(BroadcastHttpAccessArgs, Broadcast::kBroadcastHttpAccess, allArgs.parser,  allArgs.parser.url(), file_path, false, file_invoker, sender);
+            if (!flag) {
+                // 文件下载鉴权事件无人监听，不允许下载  [AUTO-TRANSLATED:5e02f0ce]
+                // No one is listening to the file download authentication event, download is not allowed
+                invoker(401, StrCaseMap {}, "None http access event listener");
+            }
         }
     });
-
 
     api_regist("/index/api/searchOnvifDevice",[](API_ARGS_MAP_ASYNC){
        CHECK_SECRET();
@@ -2428,12 +2435,7 @@ void installWebApi() {
 
     api_regist("/index/api/login", [](API_ARGS_MAP) {
         auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
-        if (logined_cookie) {
-            // 已经登录成功
-            val["code"] = API::Success;
-            val["msg"] = "You are already logined";
-            return;
-        }
+
         CHECK_ARGS("digest");
         GET_CONFIG(std::string, api_secret, API::kSecret);
 
@@ -2446,11 +2448,19 @@ void installWebApi() {
                 headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
             }
             val["cookie"] = unlogin_cookie->getCookie();
+            if (logined_cookie) {
+                // secret校验失败，注销登录
+                logined_cookie->setExpired();
+                HttpCookieManager::Instance().delCookie(logined_cookie);
+                headerOut.emplace_force("Set-Cookie", logined_cookie->getCookie(kLoginCookiePath));
+            }
             throw AuthException("Digest does not match, incorrect secret?", headerOut, val);
         }
-        // 登录成功, cookie保持24小时
-        logined_cookie = HttpCookieManager::Instance().addCookie(kLoginedCookieName, "", kLoginedCookieLifeSeconds);
-        headerOut["Set-Cookie"] = logined_cookie->getCookie(kLoginCookiePath);
+        if (!logined_cookie) {
+            // 未登陆状态，设置登录成功, cookie保持24小时
+            logined_cookie = HttpCookieManager::Instance().addCookie(kLoginedCookieName, "", kLoginedCookieLifeSeconds);
+            headerOut["Set-Cookie"] = logined_cookie->getCookie(kLoginCookiePath);
+        }
 
         // 删除未登录状态的cookie
         unlogin_cookie->setExpired();
