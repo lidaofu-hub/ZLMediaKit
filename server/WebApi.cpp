@@ -86,7 +86,6 @@ const string kSecret = API_FIELD"secret";
 const string kSnapRoot = API_FIELD"snapRoot";
 const string kDefaultSnap = API_FIELD"defaultSnap";
 const string kDownloadRoot = API_FIELD"downloadRoot";
-const string kLegacyAuth = API_FIELD"legacyAuth";
 
 static onceToken token([]() {
     mINI::Instance()[kApiDebug] = "1";
@@ -94,7 +93,6 @@ static onceToken token([]() {
     mINI::Instance()[kSnapRoot] = "./www/snap/";
     mINI::Instance()[kDefaultSnap] = "./www/logo.png";
     mINI::Instance()[kDownloadRoot] = "./www";
-    mINI::Instance()[kLegacyAuth] = 1;
 });
 }//namespace API
 
@@ -379,10 +377,53 @@ Value ToJson(const PusherProxy::Ptr& p) {
     return item;
 }
 
+Json::Value dumpTracks(const std::vector<Track::Ptr> &tracks) {
+    Json::Value ret(arrayValue);
+    for (auto &track : tracks) {
+        Value obj;
+        auto codec_type = track->getTrackType();
+        obj["codec_id"] = track->getCodecId();
+        obj["codec_id_name"] = track->getCodecName();
+        obj["ready"] = track->ready();
+        obj["codec_type"] = codec_type;
+        obj["frames"] = track->getFrames();
+        obj["duration"] = track->getDuration();
+        switch (codec_type) {
+            case TrackAudio: {
+                auto audio_track = dynamic_pointer_cast<AudioTrack>(track);
+                obj["sample_rate"] = audio_track->getAudioSampleRate();
+                obj["channels"] = audio_track->getAudioChannel();
+                obj["sample_bit"] = audio_track->getAudioSampleBit();
+                break;
+            }
+            case TrackVideo: {
+                auto video_track = dynamic_pointer_cast<VideoTrack>(track);
+                obj["width"] = video_track->getVideoWidth();
+                obj["height"] = video_track->getVideoHeight();
+                obj["key_frames"] = video_track->getVideoKeyFrames();
+                int gop_size = video_track->getVideoGopSize();
+                int gop_interval_ms = video_track->getVideoGopInterval();
+                float fps = video_track->getVideoFps();
+                if (fps <= 1 && gop_interval_ms) {
+                    fps = gop_size * 1000.0 / gop_interval_ms;
+                }
+                obj["fps"] = round(fps);
+                obj["gop_size"] = gop_size;
+                obj["gop_interval_ms"] = gop_interval_ms;
+                break;
+            }
+            default: break;
+        }
+        ret.append(obj);
+    }
+    return ret;
+}
+
 Value ToJson(const PlayerProxy::Ptr& p) {
     Value item;
     item["url"] = p->getUrl();
     item["status"] = p->getStatus();
+    item["status_str"] = p->getStatusStr();
     item["liveSecs"] = p->getLiveSecs();
     item["rePullCount"] = p->getRePullCount();
     item["totalReaderCount"] = p->totalReaderCount();
@@ -390,10 +431,11 @@ Value ToJson(const PlayerProxy::Ptr& p) {
     item["totalBytes"] = (Json::UInt64) p->getRecvTotalBytes();
 
     dumpMediaTuple(p->getMediaTuple(), item["src"]);
+    item["tracks"] = dumpTracks(p->getTracks(false));
     return item;
 }
 
-Value makeMediaSourceJson(MediaSource &media){
+Value makeMediaSourceJson(MediaSource &media) {
     Value item;
     item["schema"] = media.getSchema();
     dumpMediaTuple(media.getMediaTuple(), item);
@@ -421,17 +463,13 @@ Value makeMediaSourceJson(MediaSource &media){
     auto current_thread = false;
     try { current_thread = media.getOwnerPoller()->isCurrentThread();} catch (...) {}
     float last_loss = -1;
-    for(auto &track : media.getTracks(false)){
-        Value obj;
-        auto codec_type = track->getTrackType();
-        obj["codec_id"] = track->getCodecId();
-        obj["codec_id_name"] = track->getCodecName();
-        obj["ready"] = track->ready();
-        obj["codec_type"] = codec_type;
-        if (current_thread) {
+    auto tracks = dumpTracks(media.getTracks(false));
+    if (current_thread) {
+        for (auto &obj : tracks) {
             // rtp推流只有一个统计器，但是可能有多个track，如果短时间多次获取间隔丢包率，第二次会获取为-1  [AUTO-TRANSLATED:5bfbc951]
-            // RTP push stream has only one statistics, but may have multiple tracks. If you get the interval packet loss rate multiple times in a short time, the second time will get -1
-            auto loss = media.getLossRate(codec_type);
+            // RTP push stream has only one statistics, but may have multiple tracks. If you get the interval packet loss rate multiple times in a short time,
+            // the second time will get -1
+            auto loss = media.getLossRate(getTrackType(static_cast<CodecId>(obj["codec_type"].asInt())));
             if (loss == -1) {
                 loss = last_loss;
             } else {
@@ -439,37 +477,8 @@ Value makeMediaSourceJson(MediaSource &media){
             }
             obj["loss"] = loss;
         }
-        obj["frames"] = track->getFrames();
-        obj["duration"] = track->getDuration();
-        switch(codec_type){
-            case TrackAudio : {
-                auto audio_track = dynamic_pointer_cast<AudioTrack>(track);
-                obj["sample_rate"] = audio_track->getAudioSampleRate();
-                obj["channels"] = audio_track->getAudioChannel();
-                obj["sample_bit"] = audio_track->getAudioSampleBit();
-                break;
-            }
-            case TrackVideo : {
-                auto video_track = dynamic_pointer_cast<VideoTrack>(track);
-                obj["width"] = video_track->getVideoWidth();
-                obj["height"] = video_track->getVideoHeight();
-                obj["key_frames"] = video_track->getVideoKeyFrames();
-                int gop_size = video_track->getVideoGopSize();
-                int gop_interval_ms = video_track->getVideoGopInterval();
-                float fps = video_track->getVideoFps();
-                if (fps <= 1 && gop_interval_ms) {
-                    fps = gop_size * 1000.0 / gop_interval_ms;
-                }
-                obj["fps"] = round(fps);
-                obj["gop_size"] = gop_size;
-                obj["gop_interval_ms"] = gop_interval_ms;
-                break;
-            }
-            default:
-                break;
-        }
-        item["tracks"].append(obj);
     }
+    item["tracks"] = std::move(tracks);
     return item;
 }
 
@@ -583,8 +592,19 @@ void getStatisticJson(const function<void(Value &val)> &cb) {
 #endif
 }
 
-void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count,
-                    const ProtocolOption &option, int rtp_type, float timeout_sec, const mINI &args,
+void updateStreamProxy(const mediakit::MediaTuple &tuple, const std::string &url, const toolkit::mINI &args) {
+    auto key = tuple.shortUrl();
+    auto player = s_player_proxy.find(key);
+    if (!player) {
+        throw std::runtime_error("proxy player not found: " + key);
+    }
+    player->getPoller()->async([url, args, player]() {
+        player->update(url, args);
+    });
+}
+
+void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count, bool force,
+                    const ProtocolOption &option, float timeout_sec, const mINI &args,
                     const function<void(const SockException &ex, const string &key)> &cb) {
     auto key = tuple.shortUrl();
     if (s_player_proxy.find(key)) {
@@ -603,10 +623,6 @@ void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count,
         (*player)[pr.first] = pr.second;
     }
 
-    // 指定RTP over TCP(播放rtsp时有效)  [AUTO-TRANSLATED:1a062656]
-    // Specify RTP over TCP (effective when playing RTSP)
-    (*player)[Client::kRtpType] = rtp_type;
-
     if (timeout_sec > 0.1f) {
         // 播放握手超时时间  [AUTO-TRANSLATED:5a29ae1f]
         // Play handshake timeout
@@ -615,11 +631,18 @@ void addStreamProxy(const MediaTuple &tuple, const string &url, int retry_count,
 
     // 开始播放，如果播放失败或者播放中止，将会自动重试若干次，默认一直重试  [AUTO-TRANSLATED:ac8499e5]
     // Start playing. If playback fails or is stopped, it will automatically retry several times, by default it will retry indefinitely
-    player->setPlayCallbackOnce([cb, key](const SockException &ex) {
-        if (ex) {
-            s_player_proxy.erase(key);
+    player->setPlayCallbackOnce([cb, key, force](const SockException &ex) {
+        if (force) {
+            // 强制添加成功
+            cb(SockException(), key);
+        } else {
+            // 非强制添加
+            if (ex) {
+                // 失败则移除记录
+                s_player_proxy.erase(key);
+            }
+            cb(ex, key);
         }
-        cb(ex, key);
     });
 
     // 被主动关闭拉流  [AUTO-TRANSLATED:41a19476]
@@ -722,19 +745,14 @@ static constexpr size_t kLoginedCookieLifeSeconds = 24 * 3600;
 
 template <typename T>
 void check_secret(toolkit::SockInfo &sender, mediakit::HttpSession::KeyValue &headerOut, const HttpAllArgs<T> &allArgs, Json::Value &val) {
-    GET_CONFIG(bool, legacy_auth , API::kLegacyAuth);
     GET_CONFIG(std::string, api_secret, API::kSecret);
 
     auto ip = sender.get_peer_ip();
     if (!HttpFileManager::isIPAllowed(ip)) {
         throw AuthException("Your ip is not allowed to access the service.");
     }
-    if (legacy_auth) {
-        CHECK_ARGS("secret");
-        if (api_secret != allArgs["secret"]) {
-            throw AuthException("Incorrect secret");
-        }
-    } else {
+
+    try {
         auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
         if (!logined_cookie) {
             auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
@@ -745,6 +763,20 @@ void check_secret(toolkit::SockInfo &sender, mediakit::HttpSession::KeyValue &he
             val["cookie"] = unlogin_cookie->getCookie();
             throw AuthException("Please login first", headerOut, val);
         }
+        // 优先cookie登陆鉴权
+    } catch (...) {
+        try {
+            // cookie登陆鉴权失败了再比对secret
+            CHECK_ARGS("secret");
+            if (api_secret != allArgs["secret"]) {
+                throw AuthException("Incorrect secret");
+            }
+            return;
+        } catch (...) {
+            // 未提供secret或secret不匹配，这个异常隐藏
+        }
+        // secret鉴权模式失败，抛出要求cookie登录的异常
+        throw;
     }
 }
 
@@ -1225,19 +1257,19 @@ void installWebApi() {
     });
     api_regist("/index/api/listStreamPusherProxy", [](API_ARGS_MAP) {
         CHECK_SECRET();
-        s_pusher_proxy.for_each([&val](const std::string& key, const PusherProxy::Ptr& p) {
+        s_pusher_proxy.for_each([&val](const std::string &key, const PusherProxy::Ptr &p) {
             Json::Value item = ToJson(p);
             item["key"] = key;
             val["data"].append(item);
-        });
+        }, allArgs["key"]);
     });
     api_regist("/index/api/listStreamProxy", [](API_ARGS_MAP) {
         CHECK_SECRET();
-        s_player_proxy.for_each([&val](const std::string& key, const PlayerProxy::Ptr& p) {
+        s_player_proxy.for_each([&val](const std::string &key, const PlayerProxy::Ptr &p) {
             Json::Value item = ToJson(p);
             item["key"] = key;
             val["data"].append(item);
-        });
+        }, allArgs["key"]);
     });
     // 动态添加rtsp/rtmp拉流代理  [AUTO-TRANSLATED:2616537c]
     // Dynamically add rtsp/rtmp pull stream proxy
@@ -1264,8 +1296,8 @@ void installWebApi() {
             addStreamProxy(tuple,
                            allArgs["url"],
                            retry_count,
+                           allArgs["force"],
                            option,
-                           allArgs["rtp_type"],
                            allArgs["timeout_sec"],
                            args,
                            [invoker,val,headerOut](const SockException &ex,const string &key) mutable {

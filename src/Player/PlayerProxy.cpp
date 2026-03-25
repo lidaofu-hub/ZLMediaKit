@@ -32,7 +32,7 @@ PlayerProxy::PlayerProxy(
     setOnClose(nullptr);
     setOnConnect(nullptr);
     setOnDisconnect(nullptr);
-    
+
     _reconnect_delay_min = reconnect_delay_min > 0 ? reconnect_delay_min : 2;
     _reconnect_delay_max = reconnect_delay_max > 0 ? reconnect_delay_max : 60;
     _reconnect_delay_step = reconnect_delay_step > 0 ? reconnect_delay_step : 3;
@@ -40,6 +40,16 @@ PlayerProxy::PlayerProxy(
     _live_status = 1;
     _repull_count = 0;
     (*this)[Client::kWaitTrackReady] = false;
+}
+
+void PlayerProxy::update(const std::string &url, const toolkit::mINI &args) {
+    CHECK(getPoller()->isCurrentThread());
+    _pull_url = url;
+    this->mINI::clear();
+    (*this)[Client::kWaitTrackReady] = false;
+    for (auto &pr : args) {
+        (*this)[pr.first] = pr.second;
+    }
 }
 
 void PlayerProxy::setPlayCallbackOnce(function<void(const SockException &ex)> cb) {
@@ -51,15 +61,14 @@ void PlayerProxy::setOnClose(function<void(const SockException &ex)> cb) {
 }
 
 void PlayerProxy::setOnDisconnect(std::function<void()> cb) {
-    _on_disconnect = cb ? std::move(cb) : [] () {};
+    _on_disconnect = cb ? std::move(cb) : []() {};
 }
 
-void PlayerProxy::setOnConnect(std::function<void(const TranslationInfo&)> cb) {
-    _on_connect = cb ? std::move(cb) : [](const TranslationInfo&) {};
+void PlayerProxy::setOnConnect(std::function<void(const TranslationInfo &)> cb) {
+    _on_connect = cb ? std::move(cb) : [](const TranslationInfo &) {};
 }
 
-void PlayerProxy::setTranslationInfo()
-{
+void PlayerProxy::setTranslationInfo() {
     _transtalion_info.byte_speed = _media_src ? _media_src->getBytesSpeed() : -1;
     _transtalion_info.start_time_stamp = _media_src ? _media_src->getCreateStamp() : 0;
     _transtalion_info.stream_info.clear();
@@ -72,22 +81,21 @@ void PlayerProxy::setTranslationInfo()
         back.codec_type = track->getTrackType();
         back.codec_name = track->getCodecName();
         switch (back.codec_type) {
-            case TrackAudio : {
+            case TrackAudio: {
                 auto audio_track = dynamic_pointer_cast<AudioTrack>(track);
                 back.audio_sample_rate = audio_track->getAudioSampleRate();
                 back.audio_channel = audio_track->getAudioChannel();
                 back.audio_sample_bit = audio_track->getAudioSampleBit();
                 break;
             }
-            case TrackVideo : {
+            case TrackVideo: {
                 auto video_track = dynamic_pointer_cast<VideoTrack>(track);
                 back.video_width = video_track->getVideoWidth();
                 back.video_height = video_track->getVideoHeight();
                 back.video_fps = video_track->getVideoFps();
                 break;
             }
-            default:
-                break;
+            default: break;
         }
     }
 }
@@ -101,11 +109,53 @@ static int getMaxTrackSize(const std::string &url) {
     return 2;
 }
 
-void PlayerProxy::play(const string &strUrlTmp) {
-    _option.max_track = getMaxTrackSize(strUrlTmp);
+void PlayerProxy::play(const string &url) {
+    _pull_url = url;
+    _option.max_track = getMaxTrackSize(_pull_url);
     weak_ptr<PlayerProxy> weakSelf = shared_from_this();
     std::shared_ptr<int> piFailedCnt(new int(0)); // 连续播放失败次数
-    setOnPlayResult([weakSelf, strUrlTmp, piFailedCnt](const SockException &err) {
+    setOnPlayResult([weakSelf, piFailedCnt](const SockException &err) {
+        auto strongSelf = weakSelf.lock();
+        if (!strongSelf) {
+            return;
+        }
+        if (err) {
+            NOTICE_EMIT(BroadcastPlayerProxyFailedArgs, Broadcast::kBroadcastPlayerProxyFailed, *strongSelf, err);
+            strongSelf->_status = std::make_shared<std::string>(std::string("play failed: ") + err.what());
+        }
+        if (strongSelf->_on_play) {
+            strongSelf->_on_play(err);
+            strongSelf->_on_play = nullptr;
+        }
+
+        if (!err) {
+            // 取消定时器,避免hls拉流索引文件因为网络波动失败重连成功后出现循环重试的情况  [AUTO-TRANSLATED:91e5f0c8]
+            // Cancel the timer to avoid the situation where the hls stream index file fails to reconnect due to network fluctuations and then retries in a loop
+            // after successful reconnection
+            strongSelf->_timer.reset();
+            strongSelf->_live_ticker.resetTime();
+            strongSelf->_live_status = 0;
+            // 播放成功  [AUTO-TRANSLATED:e43f9fb8]
+            // Play successfully
+            *piFailedCnt = 0; // 连续播放失败次数清0
+            strongSelf->onPlaySuccess();
+            strongSelf->setTranslationInfo();
+            strongSelf->_on_connect(strongSelf->_transtalion_info);
+
+            InfoL << "play " << strongSelf->_pull_url << " success";
+            strongSelf->_status = std::make_shared<std::string>("playing");
+        } else if (*piFailedCnt < strongSelf->_retry_count || strongSelf->_retry_count < 0) {
+            // 播放失败，延时重试播放  [AUTO-TRANSLATED:d7537c9c]
+            // Play failed, retry playing with delay
+            strongSelf->_on_disconnect();
+            strongSelf->rePlay((*piFailedCnt)++);
+        } else {
+            // 达到了最大重试次数，回调关闭  [AUTO-TRANSLATED:610f31f3]
+            // Reached the maximum number of retries, callback to close
+            strongSelf->_on_close(err);
+        }
+    });
+    setOnShutdown([weakSelf, piFailedCnt](const SockException &err) {
         auto strongSelf = weakSelf.lock();
         if (!strongSelf) {
             return;
@@ -117,40 +167,7 @@ void PlayerProxy::play(const string &strUrlTmp) {
             strongSelf->_on_play(err);
             strongSelf->_on_play = nullptr;
         }
-
-        if (!err) {
-            // 取消定时器,避免hls拉流索引文件因为网络波动失败重连成功后出现循环重试的情况  [AUTO-TRANSLATED:91e5f0c8]
-            // Cancel the timer to avoid the situation where the hls stream index file fails to reconnect due to network fluctuations and then retries in a loop after successful reconnection
-            strongSelf->_timer.reset();
-            strongSelf->_live_ticker.resetTime();
-            strongSelf->_live_status = 0;
-            // 播放成功  [AUTO-TRANSLATED:e43f9fb8]
-            // Play successfully
-            *piFailedCnt = 0; // 连续播放失败次数清0
-            strongSelf->onPlaySuccess();
-            strongSelf->setTranslationInfo();
-            strongSelf->_on_connect(strongSelf->_transtalion_info);  
-
-            InfoL << "play " << strUrlTmp << " success";
-        } else if (*piFailedCnt < strongSelf->_retry_count || strongSelf->_retry_count < 0) {
-            // 播放失败，延时重试播放  [AUTO-TRANSLATED:d7537c9c]
-            // Play failed, retry playing with delay
-            strongSelf->_on_disconnect();
-            strongSelf->rePlay(strUrlTmp, (*piFailedCnt)++);
-        } else {
-            // 达到了最大重试次数，回调关闭  [AUTO-TRANSLATED:610f31f3]
-            // Reached the maximum number of retries, callback to close
-            strongSelf->_on_close(err);
-        }
-    });
-    setOnShutdown([weakSelf, strUrlTmp, piFailedCnt](const SockException &err) {
-        auto strongSelf = weakSelf.lock();
-        if (!strongSelf) {
-            return;
-        }
-        if (err) {
-            NOTICE_EMIT(BroadcastPlayerProxyFailedArgs, Broadcast::kBroadcastPlayerProxyFailed, *strongSelf, err);
-        }
+        strongSelf->_status = std::make_shared<std::string>(std::string("play shutdown: ") + err.what());
 
         // 注销直接拉流代理产生的流：#532  [AUTO-TRANSLATED:c6343a3b]
         // Unregister the stream generated by the direct stream proxy: #532
@@ -182,7 +199,7 @@ void PlayerProxy::play(const string &strUrlTmp) {
         // Play interrupted abnormally, retry playing with delay
         if (*piFailedCnt < strongSelf->_retry_count || strongSelf->_retry_count < 0) {
             strongSelf->_repull_count++;
-            strongSelf->rePlay(strUrlTmp, (*piFailedCnt)++);
+            strongSelf->rePlay((*piFailedCnt)++);
         } else {
             // 达到了最大重试次数，回调关闭  [AUTO-TRANSLATED:610f31f3]
             // Reached the maximum number of retries, callback to close
@@ -190,13 +207,14 @@ void PlayerProxy::play(const string &strUrlTmp) {
         }
     });
     try {
-        MediaPlayer::play(strUrlTmp);
+        _status = std::make_shared<std::string>("connecting");
+        MediaPlayer::play(_pull_url );
     } catch (std::exception &ex) {
+        _status = std::make_shared<std::string>(std::string("play failed: ") + ex.what());
         ErrorL << ex.what();
         onPlayResult(SockException(Err_other, ex.what()));
         return;
     }
-    _pull_url = strUrlTmp;
     setDirectProxy();
 }
 
@@ -236,24 +254,21 @@ PlayerProxy::~PlayerProxy() {
     }
 }
 
-void PlayerProxy::rePlay(const string &strUrl, int iFailedCnt) {
+void PlayerProxy::rePlay(int iFailedCnt) {
     auto iDelay = MAX(_reconnect_delay_min * 1000, MIN(iFailedCnt * _reconnect_delay_step * 1000, _reconnect_delay_max * 1000));
     weak_ptr<PlayerProxy> weakSelf = shared_from_this();
-    _timer = std::make_shared<Timer>(
-        iDelay / 1000.0f,
-        [weakSelf, strUrl, iFailedCnt]() {
-            // 播放失败次数越多，则延时越长  [AUTO-TRANSLATED:5af39264]
-            // The more times the playback fails, the longer the delay
-            auto strongPlayer = weakSelf.lock();
-            if (!strongPlayer) {
-                return false;
-            }
-            WarnL << "重试播放[" << iFailedCnt << "]:" << strUrl;
-            strongPlayer->MediaPlayer::play(strUrl);
-            strongPlayer->setDirectProxy();
+    _timer = std::make_shared<Timer>(iDelay / 1000.0f, [weakSelf, iFailedCnt]() {
+        // 播放失败次数越多，则延时越长  [AUTO-TRANSLATED:5af39264]
+        // The more times the playback fails, the longer the delay
+        auto strongPlayer = weakSelf.lock();
+        if (!strongPlayer) {
             return false;
-        },
-        getPoller());
+        }
+        WarnL << "重试播放[" << iFailedCnt << "]:" << strongPlayer->_pull_url;
+        strongPlayer->MediaPlayer::play(strongPlayer->_pull_url);
+        strongPlayer->setDirectProxy();
+        return false;
+    }, getPoller());
 }
 
 bool PlayerProxy::close(MediaSource &sender) {
@@ -291,7 +306,7 @@ float PlayerProxy::getLossRate(MediaSource &sender, TrackType type) {
     return getPacketLossRate(type);
 }
 
-toolkit::EventPoller::Ptr PlayerProxy::getOwnerPoller(MediaSource &sender) { 
+toolkit::EventPoller::Ptr PlayerProxy::getOwnerPoller(MediaSource &sender) {
     return getPoller();
 }
 
@@ -314,10 +329,10 @@ void PlayerProxy::onPlaySuccess() {
         // rtmp拉流代理  [AUTO-TRANSLATED:21173335]
         // Rtmp stream proxy
         if (reset_when_replay || !_muxer) {
-             auto old = _option.enable_rtmp;
+            auto old = _option.enable_rtmp;
             _option.enable_rtmp = false;
             _muxer = std::make_shared<MultiMediaSourceMuxer>(_tuple, getDuration(), _option);
-             _option.enable_rtmp = old;
+            _option.enable_rtmp = old;
         }
     } else {
         // 其他拉流代理  [AUTO-TRANSLATED:e5f2e45d]
@@ -362,6 +377,12 @@ void PlayerProxy::onPlaySuccess() {
 int PlayerProxy::getStatus() {
     return _live_status.load();
 }
+
+std::string PlayerProxy::getStatusStr() const {
+    auto status = _status;
+    return status ? *status : "unknown";
+}
+
 uint64_t PlayerProxy::getLiveSecs() {
     if (_live_status == 0) {
         return _live_secs + _live_ticker.elapsedTime() / 1000;

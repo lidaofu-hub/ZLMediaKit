@@ -129,6 +129,7 @@ public:
     int totalReaderCount();
 
     int getStatus();
+    std::string getStatusStr() const;
     uint64_t getLiveSecs();
     uint64_t getRePullCount();
 
@@ -138,6 +139,8 @@ public:
     const std::string& getUrl() const { return _pull_url; }
     const MediaTuple& getMediaTuple() const { return _tuple; }
     const ProtocolOption& getOption() const { return _option; }
+
+    void update(const std::string &url, const toolkit::mINI &args);
 
 private:
     // MediaSourceEvent override
@@ -149,12 +152,13 @@ private:
     float getLossRate(MediaSource &sender, TrackType type) override;
     toolkit::EventPoller::Ptr getOwnerPoller(MediaSource &sender) override;
 
-    void rePlay(const std::string &strUrl, int iFailedCnt);
+    void rePlay(int iFailedCnt);
     void onPlaySuccess();
     void setDirectProxy();
     void setTranslationInfo();
 
 private:
+    std::shared_ptr<std::string> _status;
     int _retry_count;
     int _reconnect_delay_min;
     int _reconnect_delay_max;

@@ -12,7 +12,10 @@
 #include "Util/util.h"
 #include "Util/File.h"
 #include "Common/Parser.h"
+#include "Common/macros.h"
 #include "Http/HttpSession.h"
+#include "Poller/EventPoller.h"
+#include  "WebApi.h"
 
 using namespace toolkit;
 using namespace mediakit;
@@ -102,6 +105,30 @@ mINI to_native(const py::dict &opt) {
     return ret;
 }
 
+void python_api_debug(const Parser &parser, const std::string &body) {
+    GET_CONFIG(bool, api_debug, API::kApiDebug);
+    if (!api_debug) {
+        return;
+    }
+    ssize_t size = body.size();
+    LogContextCapture log(getLogger(), toolkit::LDebug, __FILE__, "python http api debug", __LINE__);
+    log << "\r\n# request:\r\n" << parser.method() << " " << parser.fullUrl() << "\r\n";
+    log << "# header:\r\n";
+
+    for (auto &pr : parser.getHeader()) {
+        log << pr.first << " : " << pr.second << "\r\n";
+    }
+
+    auto &content = parser.content();
+    log << "# content:\r\n" << (content.size() > 4 * 1024 ? content.substr(0, 4 * 1024) : content) << "\r\n";
+
+    if (size > 0 && size < 4 * 1024) {
+        log << "# response:\r\n" << body << "\r\n";
+    } else {
+        log << "# response size:" << size << "\r\n";
+    }
+}
+
 void handle_http_request(const py::object &check_route, const py::object &submit_coro, const Parser &parser, const HttpSession::HttpResponseInvoker &invoker, bool &consumed, toolkit::SockInfo &sender) {
     py::gil_scoped_acquire guard;
 
@@ -113,7 +140,8 @@ void handle_http_request(const py::object &check_route, const py::object &submit
     scope["query_string"] = parser.params();
     py::list hdrs;
     for (auto &kv : parser.getHeader()) {
-        hdrs.append(py::make_tuple(py::bytes(kv.first), py::bytes(kv.second)));
+        // Starlette/ASGI 规范要求 headers 的 key 必须全小写字节串
+        hdrs.append(py::make_tuple(py::bytes(toolkit::strToLower(kv.first.data())), py::bytes(kv.second)));
     }
     scope["headers"] = hdrs;
 
@@ -129,11 +157,8 @@ void handle_http_request(const py::object &check_route, const py::object &submit
     try {
         auto args = getAllArgs(parser);
         auto allArgs = ArgsMap(parser, args);
-        GET_CONFIG(bool, legacy_auth , API::kLegacyAuth);
-        if (!legacy_auth) {
-            // 非传统secret鉴权模式，Python接口强制要求登录鉴权
-            CHECK_SECRET();
-        }
+        // Python接口要求登录鉴权
+        CHECK_SECRET();
     } catch (std::exception &ex) {
         auto ex1 = dynamic_cast<ApiRetException *>(&ex);
         if (ex1) {
@@ -150,7 +175,7 @@ void handle_http_request(const py::object &check_route, const py::object &submit
     StrCaseMap resp_headers;
     std::string resp_body;
     int status = 500;
-    auto send = py::cpp_function([invoker, status, resp_body, resp_headers](const py::dict &msg) mutable {
+    auto send = py::cpp_function([parser, invoker, status, resp_body, resp_headers](const py::dict &msg) mutable {
         auto type = msg["type"].cast<std::string>();
         if (type == "http.response.start") {
             status = msg["status"].cast<int>();
@@ -166,6 +191,7 @@ void handle_http_request(const py::object &check_route, const py::object &submit
             // 💥 只在 more_body=False 时回调
             bool more = msg.contains("more_body") && msg["more_body"].cast<bool>();
             if (!more) {
+                python_api_debug(parser, resp_body);
                 invoker(status, resp_headers, resp_body);
             }
         }
@@ -301,6 +327,66 @@ PYBIND11_EMBEDDED_MODULE(mk_loader, m) {
         auto &invoker = to_native<HttpSession::HttpAccessPathInvoker>(cap);
         invoker(errMsg, accessPath, cookieLifeSecond);
     });
+
+    // add_stream_proxy(vhost, app, stream, url, cb, retry_count=-1, force=False,
+    //                  rtp_type=0, timeout_sec=0, opt={})
+    // opt 字典可包含 ProtocolOption 的所有字段，以及其他透传给 Player 的 key-value 参数
+    m.def("add_stream_proxy",
+        [](const std::string &vhost, const std::string &app, const std::string &stream,
+           const std::string &url, const py::object &cb,
+           int retry_count, bool force, float timeout_sec,
+           const py::dict &opt) {
+            mINI args = to_native(opt);
+            ProtocolOption option;
+            option.load(args);
+            MediaTuple tuple { vhost.empty() ? DEFAULT_VHOST : vhost, app, stream, "" };
+
+            // 用 shared_ptr 包裹 py::object，使其析构（dec_ref）可在受控环境下执行。
+            // 必须在 GIL 持有期间创建该 shared_ptr（此处仍在 GIL 内）。
+            // 自定义 deleter 保证即使在非 Python 线程析构时也会先获取 GIL。
+            auto cb_ptr = std::shared_ptr<py::object>(
+                new py::object(cb),
+                [](py::object *p) {
+                    // dec_ref / 析构 py::object 需要 GIL
+                    py::gil_scoped_acquire guard;
+                    delete p;
+                }
+            );
+
+            py::gil_scoped_release release;
+            EventPollerPool::Instance().getPoller(false)->async([=]() mutable {
+                addStreamProxy(tuple, url, retry_count, force, option, timeout_sec, args,
+                    [cb_ptr](const SockException &ex, const std::string &key) {
+                        // cb_ptr 按值捕获（shared_ptr 的拷贝，纯 C++ 操作，无需 GIL）
+                        // inc_ref/dec_ref/调用 Python 对象均在 gil_scoped_acquire 保护下进行
+                        py::gil_scoped_acquire guard;
+                        try {
+                            (*cb_ptr)(ex ? ex.what() : "", key);
+                        } catch (py::error_already_set &e) {
+                            WarnL << "Python exception in add_stream_proxy callback: " << e.what();
+                        }
+                        // cb_ptr 在此析构（局部副本），dec_ref 由自定义 deleter 在 GIL 下执行
+                    });
+            });
+        },
+        py::arg("vhost"), py::arg("app"), py::arg("stream"), py::arg("url"), py::arg("cb"),
+        py::arg("retry_count") = -1, py::arg("force") = false,
+        py::arg("timeout_sec") = 0.0f, py::arg("opt") = py::dict()
+    );
+
+    // update_stream_proxy(vhost, app, stream, url, opt={})
+    // 更新已有拉流代理的 url 和参数，流不存在时抛出异常
+    m.def("update_stream_proxy",
+        [](const std::string &vhost, const std::string &app, const std::string &stream,
+           const std::string &url, const py::dict &opt) {
+            mINI args = to_native(opt);
+            MediaTuple tuple { vhost.empty() ? DEFAULT_VHOST : vhost, app, stream, "" };
+            py::gil_scoped_release release;
+            updateStreamProxy(tuple, url, args);
+        },
+        py::arg("vhost"), py::arg("app"), py::arg("stream"), py::arg("url"),
+        py::arg("opt") = py::dict()
+    );
 
     m.def("set_fastapi", [](const py::object &check_route, const py::object &submit_coro) {
         static void *fastapi_tag = nullptr;
@@ -474,7 +560,7 @@ bool set_python_path() {
         PrintI("PYTHONPATH is already set to: %s", env_var);
         return false;
     }
-    auto default_path = exeDir() + "/python";
+    auto default_path = exeDir() + "/python:" + exeDir() + "/pymkui/backend";
     // 1 表示覆盖已存在的值
     if (!set_env("PYTHONPATH", default_path.data())) {
         PrintW("Failed to set PYTHONPATH");

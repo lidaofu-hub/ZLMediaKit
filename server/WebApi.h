@@ -55,7 +55,7 @@ typedef enum {
 } ApiErr;
 
 extern const std::string kSecret;
-extern const std::string kLegacyAuth;
+extern const std::string kApiDebug;
 } // namespace API
 
 class ApiRetException : public std::runtime_error {
@@ -248,9 +248,11 @@ uint16_t openRtpServer(uint16_t local_port, const mediakit::MediaTuple &tuple, i
 Json::Value makeMediaSourceJson(mediakit::MediaSource &media);
 ApiArgsType getAllArgs(const mediakit::Parser &parser);
 void getStatisticJson(const std::function<void(Json::Value &val)> &cb);
-void addStreamProxy(const mediakit::MediaTuple &tuple, const std::string &url, int retry_count,
-                    const mediakit::ProtocolOption &option, int rtp_type, float timeout_sec, const toolkit::mINI &args,
+void addStreamProxy(const mediakit::MediaTuple &tuple, const std::string &url, int retry_count, bool force,
+                    const mediakit::ProtocolOption &option, float timeout_sec, const toolkit::mINI &args,
                     const std::function<void(const toolkit::SockException &ex, const std::string &key)> &cb);
+
+void updateStreamProxy(const mediakit::MediaTuple &tuple, const std::string &url, const toolkit::mINI &args);
 
 template <typename Type>
 class ServiceController {
@@ -295,12 +297,20 @@ public:
         return it->second;
     }
 
-    void for_each(const std::function<void(const std::string&, const Pointer&)>& cb) {
+    void for_each(const std::function<void(const std::string &, const Pointer &)> &cb, const std::string &key = {}) {
         std::lock_guard<std::recursive_mutex> lck(_mtx);
-        auto it = _map.begin();
-        while (it != _map.end()) {
-            cb(it->first, it->second);
-            it++;
+        if (key.empty()) {
+            auto it = _map.begin();
+            while (it != _map.end()) {
+                cb(it->first, it->second);
+                ++it;
+            }
+        } else {
+            auto it = _map.find(key);
+            if (it == _map.end()) {
+                throw std::invalid_argument("key not found: " + key);
+            }
+            cb(key, it->second);
         }
     }
 
