@@ -277,7 +277,7 @@ bool MediaSource::setupRecord(Recorder::type type, bool start, const string &cus
         WarnL << "未设置MediaSource的事件监听者，setupRecord失败:" << getUrl();
         return false;
     }
-    return listener->getMuxer(const_cast<MediaSource &>(*this))->setupRecord(type, start, custom_path, max_second);
+    return listener->getMuxer(const_cast<MediaSource &>(*this))->setupRecord(*this, type, start, custom_path, max_second);
 }
 
 bool MediaSource::isRecording(Recorder::type type){
