@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include "json/json.h"
 #include "Util/Byte.hpp"
+#include "Util/TimeTicker.h"
 #include "Poller/Timer.h"
 #include "Poller/EventPoller.h"
 #include "Network/Socket.h"
@@ -312,6 +313,7 @@ public:
         virtual void onIceTransportGatheringCandidate(const Pair::Ptr&, const CandidateInfo&) = 0;
         virtual void onIceTransportDisconnected() = 0;
         virtual void onIceTransportCompleted() = 0;
+        virtual void onIceTransportSelectedTuple(const Pair::Ptr&) {}
     };
 
 public:
@@ -413,14 +415,25 @@ public:
     using Ptr = std::shared_ptr<IceServer>;
     using WeakPtr = std::weak_ptr<IceServer>;
     IceServer(Listener* listener, std::string ufrag, std::string password, toolkit::EventPoller::Ptr poller);
-    virtual ~IceServer() {}
-    
+    ~IceServer() override { releaseSessionResources(); }
+
+    void initialize() override;
     bool processSocketData(const uint8_t* data, size_t len, const Pair::Ptr& pair) override;
+    void releaseSessionResources();
+    bool hasAllocation() const;
     void relayForwordingData(const toolkit::Buffer::Ptr& buffer, const sockaddr_storage& peer_addr);
     void relayBackingData(const toolkit::Buffer::Ptr& buffer, const Pair::Ptr& pair, const sockaddr_storage& peer_addr);
 
 protected:
+    enum class AllocateRequestState {
+        NewAllocation,
+        Retransmission,
+        AllocationMismatch,
+    };
+
     void processRelayPacket(const toolkit::Buffer::Ptr &buffer, const Pair::Ptr& pair);
+    bool hasRelayedAllocation(const Pair::Ptr &pair) const;
+    AllocateRequestState classifyAllocateRequest(const StunPacket::Ptr &packet, const Pair::Ptr &pair) const;
     void handleAllocateRequest(const StunPacket::Ptr& packet, const Pair::Ptr& pair);
     void handleRefreshRequest(const StunPacket::Ptr& packet, const Pair::Ptr& pair);
     void handleCreatePermissionRequest(const StunPacket::Ptr& packet, const Pair::Ptr& pair);
@@ -435,13 +448,22 @@ protected:
 
     toolkit::SocketHelper::Ptr allocateRelayed(const Pair::Ptr& pair);
     toolkit::SocketHelper::Ptr createRelayedUdpSocket(const std::string &peer_host, uint16_t peer_port, const std::string &local_ip, uint16_t local_port);
+    void releaseAllocation();
+    void removeRelayedSessions();
+    void checkAllocationTimeout();
+    // 数据面活动保活:刷新 allocation 存活时间，避免活跃转发被超时中断
+    void touchAllocation();
 
 protected:
     std::vector<toolkit::BufferLikeString> _nonce_list;
 
     std::unordered_map<sockaddr_storage /*peer ip:port*/, std::pair<std::shared_ptr<uint16_t> /* port */, Pair::Ptr /*relayed_pairs*/>,
         toolkit::SockUtil::SockAddrHash, toolkit::SockUtil::SockAddrEqual> _relayed_pairs;
-    Pair::Ptr _session_pair;
+    std::weak_ptr<Pair> _session_pair;
+    // allocation 存活计时:每次数据面活动或 Refresh 时 resetTime()，超时由 elapsedTime() 判定
+    toolkit::Ticker _allocation_ticker;
+    std::string _allocation_transaction_id;
+    std::shared_ptr<toolkit::Timer> _allocation_timer;
 };
 
 class IceAgent : public IceTransport {
@@ -542,14 +564,13 @@ public:
         _state = state;
     }
 
-    Pair::Ptr getSelectedPair(bool try_last = false) const {
-        return try_last ?  _last_selected_pair.lock() : _selected_pair;
-    }
+    Pair::Ptr getSelectedPair(bool try_last = false);
+
     bool setSelectedPair(const Pair::Ptr& pair);
 
     void removePair(const toolkit::SocketHelper *socket);
 
-    std::vector<Pair::Ptr> getPairs() const;
+    std::vector<Pair::Ptr> getPairs();
 
     // 获取checklist信息，用于API查询
     Json::Value getChecklistInfo() const;
@@ -613,7 +634,7 @@ protected:
     Pair::Ptr _selected_pair;
     Pair::Ptr _nominated_pair;
     StunPacket::Ptr _nominated_response;
-    std::weak_ptr<Pair>  _last_selected_pair;
+    std::list<std::weak_ptr<Pair> > _old_pairs;
 
     // 双向索引的候选地址管理结构
     struct SocketCandidateManager {

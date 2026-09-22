@@ -72,6 +72,8 @@ const string kEnableTurn = RTC_FIELD "enableTurn";
 const string kIceUfrag = RTC_FIELD "iceUfrag";
 const string kIcePwd = RTC_FIELD "icePwd";
 const string kIceTransportPolicy = RTC_FIELD "iceTransportPolicy";
+// UDP ICE 会话空闲超时(秒)，0 为关闭
+const string kIceSessionTimeoutSec = RTC_FIELD "iceSessionTimeoutSec";
 
 // 比特率设置  [AUTO-TRANSLATED:2c75f5bc]
 // Bitrate setting
@@ -98,12 +100,13 @@ static onceToken token([]() {
 
     mINI::Instance()[kDataChannelEcho] = true;
 
-    mINI::Instance()[kSignalingPort] = 3000;
-    mINI::Instance()[kSignalingSslPort] = 3001;
-    mINI::Instance()[kIcePort] = 3478;
-    mINI::Instance()[kIceTcpPort] = 3478;
+    mINI::Instance()[kSignalingPort] = 0;
+    mINI::Instance()[kSignalingSslPort] = 0;
+    mINI::Instance()[kIcePort] = 0;
+    mINI::Instance()[kIceTcpPort] = 0;
     mINI::Instance()[kEnableTurn] = 1;
     mINI::Instance()[kIceTransportPolicy] = 0;  // 默认值：不限制(kAll)
+    mINI::Instance()[kIceSessionTimeoutSec] = 60;
     mINI::Instance()[kIceUfrag] = "ZLMediaKit";
     mINI::Instance()[kIcePwd] = "ZLMediaKit";
     mINI::Instance()[kPreferredTcp] = 0;
@@ -185,14 +188,14 @@ static std::string calculateFoundation(const std::string& ip, const std::string&
     std::string type_lower = type;
     std::transform(proto_lower.begin(), proto_lower.end(), proto_lower.begin(), ::tolower);
     std::transform(type_lower.begin(), type_lower.end(), type_lower.begin(), ::tolower);
-    
+
     std::string foundation_base = type_lower + "-" + ip + "-" + proto_lower;
-    
+
     // 对于server reflexive和relay候选，需要包含STUN/TURN服务器地址
     if ((type_lower == "srflx" || type_lower == "relay") && !stun_server.empty()) {
         foundation_base += "-" + stun_server;
     }
-    
+
     std::hash<std::string> hasher;
     size_t hash_value = hasher(foundation_base);
     char foundation_str[9];
@@ -200,7 +203,7 @@ static std::string calculateFoundation(const std::string& ip, const std::string&
     return foundation_str;
 }
 
-static SdpAttrCandidate::Ptr makeIceCandidate(std::string ip, uint16_t port, uint32_t priority = 100, 
+static SdpAttrCandidate::Ptr makeIceCandidate(std::string ip, uint16_t port, uint32_t priority = 100,
     const std::string &proto = "udp", const std::string &type = "host",
     const std::string &base_host = "", uint16_t base_port = 0, const std::string &stun_server = "") {
     auto candidate = std::make_shared<SdpAttrCandidate>();
@@ -214,12 +217,12 @@ static SdpAttrCandidate::Ptr makeIceCandidate(std::string ip, uint16_t port, uin
     if (strcasecmp(proto.c_str(), "tcp") == 0) {
         candidate->type += " tcptype passive";
     }
-    
+
     if (type != "host" && !base_host.empty() && base_port > 0) {
         candidate->arr.emplace_back("raddr", base_host);
         candidate->arr.emplace_back("rport", std::to_string(base_port));
     }
-    
+
     return candidate;
 }
 
@@ -343,7 +346,7 @@ void WebRtcTransport::getTransportInfo(const std::function<void(Json::Value)>& c
             result["dtls_state"] = strong_self->_dtls_transport? "connected" : "disconnected";
             result["srtp_send_ready"] = (strong_self->_srtp_session_send != nullptr);
             result["srtp_recv_ready"] = (strong_self->_srtp_session_recv != nullptr);
-            
+
             // ICE 连接检查列表信息
             if (strong_self->_ice_agent) {
                 Json::Value ice_info = strong_self->_ice_agent->getChecklistInfo();
@@ -351,12 +354,12 @@ void WebRtcTransport::getTransportInfo(const std::function<void(Json::Value)>& c
             } else {
                 result["ice_checklists"] = Json::nullValue;
             }
-            
-            
+
+
         } catch (const std::exception& ex) {
             result["error"] = std::string("Exception occurred: ") + ex.what();
         }
-        
+
         callback(std::move(result));
     });
 }
@@ -425,6 +428,12 @@ void WebRtcTransport::onIceTransportCompleted() {
 
 void WebRtcTransport::onIceTransportDisconnected() {
     InfoL << getIdentifier();
+}
+
+void WebRtcTransport::onIceTransportSelectedTuple(const IceTransport::Pair::Ptr& pair) {
+    if (pair && pair->_socket) {
+        pair->_socket->setSendFlushFlag(false);
+    }
 }
 
 void WebRtcTransport::onIceTransportGatheringCandidate(const IceTransport::Pair::Ptr &pair, const CandidateInfo &candidate) {
@@ -608,6 +617,7 @@ void WebRtcTransport::setOnShutdown(function<void(const SockException &ex)> cb) 
 
 void WebRtcTransport::onShutdown(const SockException &ex) {
     TraceL << ex;
+    _ex = ex;
     if (_on_shutdown) {
         _on_shutdown(ex);
     }
@@ -739,6 +749,9 @@ static bool isDtls(const char *buf) {
 }
 
 void WebRtcTransport::inputSockData(const char *buf, int len, const SocketHelper::Ptr& socket, struct sockaddr *addr, int addr_len) {
+    if (_ex) {
+        throw _ex;
+    }
     IceTransport::Pair::Ptr pair;
     if (addr != nullptr) {
         auto peer_host = SockUtil::inet_ntoa(addr);
@@ -1135,7 +1148,7 @@ public:
         }
         return rtp;
     }
-    void onRtcp(RtcpHeader *sr) { 
+    void onRtcp(RtcpHeader *sr) {
         _rtcp_context.onRtcp(sr);
     }
     Buffer::Ptr createRtcpRR(uint32_t ssrc) {
@@ -1384,7 +1397,7 @@ void WrappedRtpTrack::inputRtp(const char *buf, size_t len, uint64_t stamp_ms, R
     // 修改ext id至统一  [AUTO-TRANSLATED:0769b0ec]
     // Modify the ext id to be unified
     string rid;
-    auto twcc_ext = track->rtp_ext_ctx->changeRtpExtId(rtp, true, &rid, RtpExtType::transport_cc);
+    auto twcc_ext = track->rtp_ext_ctx->changeRtpExtId(rtp, len, true, &rid, RtpExtType::transport_cc);
 
     if (twcc_ext) {
         _twcc_ctx.onRtp(ssrc, twcc_ext.getTransportCCSeq(), stamp_ms);
@@ -1404,7 +1417,7 @@ void WrappedRtxTrack::inputRtp(const char *buf, size_t len, uint64_t stamp_ms, R
     // 修改ext id至统一  [AUTO-TRANSLATED:0769b0ec]
     // Modify the ext id to be unified
     string rid;
-    track->rtp_ext_ctx->changeRtpExtId(rtp, true, &rid, RtpExtType::transport_cc);
+    track->rtp_ext_ctx->changeRtpExtId(rtp, len, true, &rid, RtpExtType::transport_cc);
 
     auto &ref = track->rtp_channel[rid];
     if (!ref) {
@@ -1523,13 +1536,13 @@ void WebRtcTransportImp::onBeforeEncryptRtp(const char *buf, int &len, void *ctx
     if (!pr->first || !pr->second->plan_rtx) {
         // 普通的rtp,或者不支持rtx, 修改目标pt和ssrc  [AUTO-TRANSLATED:e1264971]
         // Ordinary RTP, or does not support RTX, modify the target PT and SSRC
-        pr->second->rtp_ext_ctx->changeRtpExtId(header, false);
+        pr->second->rtp_ext_ctx->changeRtpExtId(header, len, false);
         header->pt = pr->second->plan_rtp->pt;
         header->ssrc = htonl(pr->second->answer_ssrc_rtp);
     } else {
         // 重传的rtp, rtx  [AUTO-TRANSLATED:e863a518]
         // Retransmitted RTP, RTX
-        pr->second->rtp_ext_ctx->changeRtpExtId(header, false);
+        pr->second->rtp_ext_ctx->changeRtpExtId(header, len, false);
         header->pt = pr->second->plan_rtx->pt;
         if (pr->second->answer_ssrc_rtx) {
             // 有rtx单独的ssrc,有些情况下，浏览器支持rtx，但是未指定rtx单独的ssrc  [AUTO-TRANSLATED:181cee9a]
