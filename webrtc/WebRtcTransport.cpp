@@ -945,7 +945,7 @@ void WebRtcTransportImp::onStartWebRTC() {
             track->plan_rtp->pt, std::unique_ptr<WrappedMediaTrack>(new WrappedRtpTrack(track, _twcc_ctx, *this)));
         if (track->plan_rtx) {
             // rtx pt --> MediaTrack
-            _pt_to_track.emplace(track->plan_rtx->pt, std::unique_ptr<WrappedMediaTrack>(new WrappedRtxTrack(track)));
+            _pt_to_track.emplace(track->plan_rtx->pt, std::unique_ptr<WrappedMediaTrack>(new WrappedRtxTrack(track, _twcc_ctx)));
         }
         // 记录rtp ext类型与id的关系，方便接收或发送rtp时修改rtp ext id  [AUTO-TRANSLATED:5736bd34]
         // Record the relationship between rtp ext type and id, which is convenient for modifying rtp ext id when receiving or sending rtp
@@ -1417,7 +1417,11 @@ void WrappedRtxTrack::inputRtp(const char *buf, size_t len, uint64_t stamp_ms, R
     // 修改ext id至统一  [AUTO-TRANSLATED:0769b0ec]
     // Modify the ext id to be unified
     string rid;
-    track->rtp_ext_ctx->changeRtpExtId(rtp, len, true, &rid, RtpExtType::transport_cc);
+    auto twcc_ext = track->rtp_ext_ctx->changeRtpExtId(rtp, len, true, &rid, RtpExtType::transport_cc);
+    if (twcc_ext) {
+        // Account for the RTX packet's transport sequence before restoring the original RTP header.
+        _twcc_ctx.onRtp(ntohl(rtp->ssrc), twcc_ext.getTransportCCSeq(), stamp_ms);
+    }
 
     auto &ref = track->rtp_channel[rid];
     if (!ref) {
@@ -1661,7 +1665,13 @@ void WebRtcPluginManager::setListener(Listener cb) {
     _listener = std::move(cb);
 }
 
+// 插件注册改为首次协商时懒加载，避免静态初始化顺序问题  [AUTO-TRANSLATED:1c7b6f2c]
+// Plugin registration is deferred to the first negotiation to avoid static initialization order issues
+static void registerWebrtcPluginOnce();
+
 void WebRtcPluginManager::negotiateSdp(SocketHelper& sender, const string &type, const WebRtcArgs &args, const onCreateWebRtc &cb_in) {
+    registerWebrtcPluginOnce();
+
     onCreateWebRtc cb;
     lock_guard<mutex> lck(_mtx_creator);
     if (_listener) {
@@ -1851,20 +1861,22 @@ float WebRtcTransport::getTimeOutSec() {
     return (float)timeout;
 }
 
-static onceToken s_rtc_auto_register([]() {
+static void registerWebrtcPluginOnce() {
+    static onceToken s_rtc_auto_register([]() {
 #if !defined (NDEBUG)
-    // debug模式才开启echo插件  [AUTO-TRANSLATED:48fcb116]
-    // Enable echo plugin only in debug mode
-    WebRtcPluginManager::Instance().registerPlugin("echo", echo_plugin);
+        // debug模式才开启echo插件  [AUTO-TRANSLATED:48fcb116]
+        // Enable echo plugin only in debug mode
+        WebRtcPluginManager::Instance().registerPlugin("echo", echo_plugin);
 #endif
-    WebRtcPluginManager::Instance().registerPlugin("push", push_plugin<WebRtcPusher>);
-    WebRtcPluginManager::Instance().registerPlugin("play", play_plugin<WebRtcPlayer>);
-    WebRtcPluginManager::Instance().registerPlugin("talk", play_plugin<WebRtcTalk>);
+        WebRtcPluginManager::Instance().registerPlugin("push", push_plugin<WebRtcPusher>);
+        WebRtcPluginManager::Instance().registerPlugin("play", play_plugin<WebRtcPlayer>);
+        WebRtcPluginManager::Instance().registerPlugin("talk", play_plugin<WebRtcTalk>);
 
-    WebRtcPluginManager::Instance().setListener([](SocketHelper& sender, const std::string &type, const WebRtcArgs &args, const WebRtcInterface &rtc) {
-        setWebRtcArgs(args, const_cast<WebRtcInterface&>(rtc));
+        WebRtcPluginManager::Instance().setListener([](SocketHelper& sender, const std::string &type, const WebRtcArgs &args, const WebRtcInterface &rtc) {
+            setWebRtcArgs(args, const_cast<WebRtcInterface&>(rtc));
+        });
     });
-});
+}
 
 void WebRtcTransport::onIceTransportRecvData(const toolkit::Buffer::Ptr& buffer, const IceTransport::Pair::Ptr& pair) {
     return inputSockData(buffer->data(), buffer->size(), pair);
